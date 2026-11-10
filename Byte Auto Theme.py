@@ -34,7 +34,7 @@ from PySide6.QtCore import Qt, QLocale, QThread, QTime, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket, QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QColorDialog, QDialog, QFileDialog, QScrollArea,
     QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QProgressBar, QPushButton, QSlider, QSpinBox, QStackedWidget,
     QSystemTrayIcon, QTimeEdit, QVBoxLayout, QWidget,
@@ -67,7 +67,8 @@ DEFAULTS = {
     "screen_enabled": False, "screen_auto": True,
     "screen_day_kelvin": 6500, "screen_night_kelvin": 3800,
     "screen_manual_kelvin": 4500, "screen_night_dim": 12,
-    "screen_transition": 90,
+    "screen_transition": 90, "screen_follow_theme": True,
+    "monitor_profiles": "{}",
 }
 
 # Explicit local matches work without networking, including dotted/dotless I.
@@ -136,6 +137,22 @@ TEXT = {
     "short_color_filter": ("Renk filtresi", "Color filter"),
     "screen_enabled": ("Ekran rengini ayarla", "Adjust screen colors"),
     "screen_auto": ("Gün boyunca otomatik değiştir", "Change automatically through the day"),
+    "screen_follow_theme": ("Açık/koyu tema ile ekran renklerini eşitle", "Synchronize screen colors with light/dark theme"),
+    "monitor_options": ("Monitöre Özel Renk Ayarları…", "Per-Monitor Color Settings…"),
+    "monitor_choose": ("Bağlı ekran", "Connected display"),
+    "monitor_enabled": ("Bu monitöre renk düzeltmesi uygula", "Apply color correction to this monitor"),
+    "monitor_offset": ("Sıcaklık farkı", "Temperature adjustment"),
+    "monitor_dim": ("Ek karartma", "Additional dimming"),
+    "monitor_red": ("Kırmızı seviyesi", "Red level"),
+    "monitor_green": ("Yeşil seviyesi", "Green level"),
+    "monitor_blue": ("Mavi seviyesi", "Blue level"),
+    "monitor_pick": ("Monitöre renk tonu seç…", "Choose display tint…"),
+    "monitor_reset": ("Monitör ayarlarını sıfırla", "Reset display settings"),
+    "monitor_close": ("Kapat", "Close"),
+    "monitor_empty": ("Bağlı monitör bulunamadı", "No connected display found"),
+    "monitor_note": ("Ayarlar seçili ekrana özeldir ve kayıtlı kalır. RGB seviyeleri en fazla %100'dür. HDR, klonlama veya bazı sürücüler bağımsız renk düzeltmesini desteklemeyebilir.",
+                     "Settings apply only to the selected display and are saved. RGB levels are at most 100%. HDR, mirrored displays, and some drivers may not support independent correction."),
+
     "screen_day_kelvin": ("Gündüz sıcaklığı", "Daytime temperature"),
     "screen_night_kelvin": ("Gece sıcaklığı", "Nighttime temperature"),
     "screen_manual_kelvin": ("Sabit sıcaklık", "Fixed temperature"),
@@ -573,12 +590,14 @@ class DisplayGamma:
     READBACK_TOLERANCE = 1024
 
     def __init__(self):
-        self.displays = {}       # device name -> {dc, original}
-        self.targets = {}        # active logical display name -> monitor rectangle
+        self.displays = {}       # logical display name -> {dc, original}
+        self.targets = {}        # logical display name -> {rect, id, label}
+        self.profile_for_monitor = {}
         self.applied_names = []
         self.failed_names = []
         self._topology = None
         self._reopen = False
+        self._held_failures = set()  # drivers that reject independent gamma LUTs
         if not WINDOWS:
             return
 
@@ -593,6 +612,16 @@ class DisplayGamma:
                 ("szDevice", wintypes.WCHAR * 32),
             ]
 
+        class DisplayDevice(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32),
+                ("DeviceString", wintypes.WCHAR * 128),
+                ("StateFlags", wintypes.DWORD),
+                ("DeviceID", wintypes.WCHAR * 128),
+                ("DeviceKey", wintypes.WCHAR * 128),
+            ]
+
+        self.device_type = DisplayDevice
         self.monitor_info_type = MonitorInfoEx
         self.monitor_callback_type = ctypes.WINFUNCTYPE(
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
@@ -606,6 +635,9 @@ class DisplayGamma:
         self.user32.EnumDisplayMonitors.restype = ctypes.c_int
         self.user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.user32.GetMonitorInfoW.restype = ctypes.c_int
+        self.user32.EnumDisplayDevicesW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint, ctypes.POINTER(DisplayDevice), ctypes.c_uint]
+        self.user32.EnumDisplayDevicesW.restype = ctypes.c_int
         self.gdi.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
                                         ctypes.c_wchar_p, ctypes.c_void_p]
         self.gdi.CreateDCW.restype = ctypes.c_void_p
@@ -621,21 +653,49 @@ class DisplayGamma:
         self._reopen = True
 
     def _enumerate_monitors(self):
-        """List active desktop displays, including external and USB monitors."""
+        """Identify each active desktop target by Windows PnP monitor identity."""
         monitors = {}
 
         def receive(monitor, _hdc, _rect, _context):
             info = self.monitor_info_type()
             info.cbSize = ctypes.sizeof(info)
             if self.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                name = info.szDevice
                 rect = info.rcMonitor
-                monitors[info.szDevice] = (
-                    rect.left, rect.top, rect.right, rect.bottom)
+                device = self.device_type()
+                device.cb = ctypes.sizeof(device)
+                # EnumDisplayDevices(display-name, 0) resolves monitor name/ID.
+                valid = bool(self.user32.EnumDisplayDevicesW(name, 0,
+                                                              ctypes.byref(device), 0))
+                # DeviceID is normally the monitor's PnP instance identifier.
+                identity = (device.DeviceID.strip() if valid else "") or name
+                description = (device.DeviceString.strip() if valid else "")
+                label = name.rsplit(chr(92), 1)[-1]
+                if description and not description.lower().startswith('generic pnp'):
+                    label += " · " + description
+                label += f" ({rect.right - rect.left}×{rect.bottom - rect.top})"
+                if info.dwFlags & 1:
+                    label += " ★"
+                monitors[name] = {
+                    "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                    "id": identity.casefold(), "label": label,
+                }
             return 1
 
         callback = self.monitor_callback_type(receive)
         self.user32.EnumDisplayMonitors(None, None, callback, 0)
+        # Two identical monitors can share a reported model ID. Avoid mixing
+        # their profiles by including the logical output in that case.
+        identities = [info["id"] for info in monitors.values()]
+        for name, info in monitors.items():
+            if identities.count(info["id"]) > 1:
+                info["id"] += "|" + name.casefold()
         return monitors
+
+    def list_monitors(self):
+        self._refresh_displays()
+        return [(name, info["id"], info["label"])
+                for name, info in sorted(self.targets.items())]
 
     def _read_ramp(self, dc):
         ramp = (ctypes.c_ushort * 768)()
@@ -646,7 +706,7 @@ class DisplayGamma:
     def _open_display(self, name, old_state=None):
         # The GDI device name (e.g. r"\.\DISPLAY2") targets a particular
         # monitor; a plain desktop DC would usually target the primary screen.
-        dc = self.gdi.CreateDCW(name, None, None, None)
+        dc = self.gdi.CreateDCW("DISPLAY", name, None, None)
         if not dc:
             return None
         original = self._read_ramp(dc)
@@ -664,7 +724,8 @@ class DisplayGamma:
             self.targets = {}
             return
         targets = self._enumerate_monitors()
-        topology = tuple(sorted(targets.items()))
+        topology = tuple(sorted((name, v["rect"], v["id"])
+                                for name, v in targets.items()))
         if topology == self._topology and not self._reopen and len(self.displays) == len(targets):
             self.targets = targets
             return
@@ -676,7 +737,11 @@ class DisplayGamma:
             if old and topology == self._topology and not self._reopen:
                 current[name] = old
                 continue
-            replacement = self._open_display(name, old)
+            # A different monitor on the same DISPLAY output must not inherit
+            # the old monitor's calibration table.
+            old_identity = getattr(self, "_previous_ids", {}).get(name)
+            replacement = self._open_display(
+                name, old if old_identity == targets[name]["id"] else None)
             if replacement is not None:
                 current[name] = replacement
 
@@ -688,6 +753,9 @@ class DisplayGamma:
 
         self.displays = current
         self.targets = targets
+        self._previous_ids = {name: v["id"] for name, v in targets.items()}
+        if topology != self._topology:
+            self._held_failures.clear()
         self._topology = topology
         self._reopen = False
 
@@ -711,38 +779,69 @@ class DisplayGamma:
                    for channel in range(3)
                    for index in (0, 32, 64, 128, 192, 255))
 
-    def apply(self, kelvin, dim_percent, force=False):
+    @staticmethod
+    def safe_profile(raw):
+        if not isinstance(raw, dict):
+            raw = {}
+        def bound(key, default, lo, hi):
+            try:
+                return max(lo, min(hi, int(raw.get(key, default))))
+            except (ValueError, TypeError):
+                return default
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "offset": bound("offset", 0, -2000, 2000),
+            "dim": bound("dim", 0, 0, 20),
+            "red": bound("red", 100, 65, 100),
+            "green": bound("green", 100, 65, 100),
+            "blue": bound("blue", 100, 65, 100),
+        }
+
+    def apply(self, kelvin, dim_percent, force=False, profiles=None):
         self.applied_names = []
         self.failed_names = []
         self._refresh_displays()
         if not self.targets:
             return False
-
+        profiles = profiles or {}
         reference = kelvin_rgb(6500)
-        requested = kelvin_rgb(kelvin)
-        brightness = 1.0 - min(30.0, max(0.0, float(dim_percent))) / 100.0
-        scales = [max(0.54, min(1.0, requested[i] /
-                   max(.001, reference[i]) * brightness)) for i in range(3)]
-
-        for name in self.targets:
+        wanted_for = {}
+        # Each logical desktop monitor gets an independent gamma LUT.
+        for name, info in self.targets.items():
             state = self.displays.get(name)
             if state is None:
                 self.failed_names.append(name)
                 continue
-            dc = state["dc"]
-            wanted = self._ramp_for(state["original"], scales)
-            present = self._read_ramp(dc)
-            if force or not self._approximately_equal(present, wanted):
-                # Windows can return TRUE but still reject an extreme LUT, so
-                # verify the read-back (to the extent the driver permits).
-                applied = bool(self.gdi.SetDeviceGammaRamp(dc, ctypes.byref(wanted)))
-                present = self._read_ramp(dc) if applied else None
-            if self._approximately_equal(present, wanted):
+            correction = self.safe_profile(profiles.get(info["id"]))
+            if not correction["enabled"]:
+                wanted = state["original"]
+            else:
+                temp = max(2700, min(7500, kelvin + correction["offset"]))
+                brightness = 1.0 - max(0, min(40, dim_percent + correction["dim"])) / 100.0
+                rgb = kelvin_rgb(temp)
+                scales = [max(.54, min(1.0, rgb[i] /
+                          max(.001, reference[i]) * brightness *
+                          (correction[("red", "green", "blue")[i]] / 100.0)))
+                          for i in range(3)]
+                wanted = self._ramp_for(state["original"], scales)
+            wanted_for[name] = wanted
+            present = self._read_ramp(state["dc"])
+            if (force or name not in self._held_failures) and (
+                    force or not self._approximately_equal(present, wanted)):
+                if self.gdi.SetDeviceGammaRamp(state["dc"], ctypes.byref(wanted)):
+                    state["was_modified"] = bool(correction["enabled"])
+        # Verify AFTER all writes. Some GPU drivers use one gamma LUT for
+        # multiple outputs, so a later write may overwrite the first.
+        for name, wanted in wanted_for.items():
+            current = self._read_ramp(self.displays[name]["dc"])
+            if self._approximately_equal(current, wanted):
                 self.applied_names.append(name)
             else:
                 self.failed_names.append(name)
-
-        return bool(self.applied_names)
+        # Avoid repeatedly flickering a shared hardware gamma LUT every 10s.
+        # A forced update (user edit/theme change) retries the affected output.
+        self._held_failures = set(self.failed_names)
+        return bool(self.applied_names) and not self.failed_names
 
     def restore(self):
         if not WINDOWS:
@@ -758,6 +857,159 @@ class DisplayGamma:
         self.failed_names.clear()
         self._topology = None
         self._reopen = False
+        self._held_failures.clear()
+
+
+class MonitorSettingsDialog(QDialog):
+    """Edits persisted per-monitor gamma corrections without touching other monitors."""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle(owner.t("monitor_options"))
+        self.setMinimumSize(470, 490)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        body = QVBoxLayout(self)
+        body.setSpacing(10)
+        body.addWidget(QLabel(owner.t("monitor_choose")))
+        self.monitor_select = QComboBox()
+        self.monitor_select.currentIndexChanged.connect(self.select_monitor)
+        body.addWidget(self.monitor_select)
+        self.enabled = QCheckBox(owner.t("monitor_enabled"))
+        self.enabled.toggled.connect(self.save)
+        body.addWidget(self.enabled)
+        self.sliders = {}
+        self.value_labels = {}
+        for key, text_key, lo, hi, step, suffix in (
+            ("offset", "monitor_offset", -2000, 2000, 50, " K"),
+            ("dim", "monitor_dim", 0, 20, 1, "%"),
+            ("red", "monitor_red", 65, 100, 1, "%"),
+            ("green", "monitor_green", 65, 100, 1, "%"),
+            ("blue", "monitor_blue", 65, 100, 1, "%"),
+        ):
+            line = QHBoxLayout()
+            title = QLabel(owner.t(text_key))
+            title.setMinimumWidth(140)
+            line.addWidget(title)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(lo, hi)
+            slider.setSingleStep(step)
+            slider.setPageStep(step)
+            line.addWidget(slider, 1)
+            amount = QLabel()
+            amount.setMinimumWidth(66)
+            amount.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            line.addWidget(amount)
+            body.addLayout(line)
+            self.sliders[key] = slider
+            self.value_labels[key] = amount
+            slider.valueChanged.connect(lambda _value, k=key, a=amount, su=suffix:
+                                        self.slider_changed(k, a, su))
+        self.status = QLabel()
+        self.status.setObjectName("hint")
+        self.status.setWordWrap(True)
+        body.addWidget(self.status)
+        note = QLabel(owner.t("monitor_note"))
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        body.addWidget(note)
+        buttons = QHBoxLayout()
+        choose_tint = QPushButton(owner.t("monitor_pick"))
+        choose_tint.clicked.connect(self.choose_tint)
+        buttons.addWidget(choose_tint)
+        reset = QPushButton(owner.t("monitor_reset"))
+        reset.clicked.connect(self.reset_selected)
+        buttons.addWidget(reset)
+        close = QPushButton(owner.t("monitor_close"))
+        close.clicked.connect(self.close)
+        buttons.addWidget(close)
+        body.addLayout(buttons)
+        self.loading = False
+        self.refresh_monitors()
+
+    def refresh_monitors(self):
+        old = self.monitor_select.currentData()
+        entries = self.owner.gamma.list_monitors()
+        self.monitor_select.blockSignals(True)
+        self.monitor_select.clear()
+        for _device_name, identity, label in entries:
+            self.monitor_select.addItem(label, identity)
+        if old:
+            idx = self.monitor_select.findData(old)
+            if idx >= 0:
+                self.monitor_select.setCurrentIndex(idx)
+        self.monitor_select.blockSignals(False)
+        self.select_monitor()
+
+    def select_monitor(self, *_args):
+        self.loading = True
+        identity = self.monitor_select.currentData()
+        if identity is None:
+            self.enabled.setChecked(False)
+            self.status.setText(self.owner.t("monitor_empty"))
+            profile = DisplayGamma.safe_profile({"enabled": False})
+        else:
+            profile = DisplayGamma.safe_profile(
+                self.owner.monitor_profiles.get(identity))
+            self.status.setText(self.monitor_select.currentText())
+        self.enabled.setChecked(profile["enabled"])
+        self.enabled.setEnabled(identity is not None)
+        for key, slider in self.sliders.items():
+            slider.setValue(profile[key])
+            slider.setEnabled(bool(identity is not None and profile["enabled"]))
+        for key, slider in self.sliders.items():
+            self.slider_changed(key, self.value_labels[key],
+                                " K" if key == "offset" else "%", save=False)
+        self.loading = False
+
+    def slider_changed(self, key, label, suffix, save=True):
+        if label is not None:
+            value = self.sliders[key].value()
+            label.setText((f"{value:+d}" if key == "offset" else str(value)) + suffix)
+        if save:
+            self.save()
+
+    def save(self, *_args):
+        if self.loading:
+            return
+        identity = self.monitor_select.currentData()
+        if identity is None:
+            return
+        for slider in self.sliders.values():
+            slider.setEnabled(self.enabled.isChecked())
+        self.owner.monitor_profiles[identity] = {
+            "enabled": self.enabled.isChecked(),
+            **{key: widget.value() for key, widget in self.sliders.items()},
+        }
+        self.owner.store_monitor_profiles()
+        self.owner.update_screen(force=True)
+
+    def choose_tint(self):
+        if self.monitor_select.currentData() is None:
+            return
+        current = QColor(*[round(self.sliders[channel].value() * 255 / 100)
+                            for channel in ("red", "green", "blue")])
+        selected = QColorDialog.getColor(current, self, self.owner.t("monitor_pick"))
+        if not selected.isValid():
+            return
+        # Convert a chosen hue to conservative, legible hardware RGB gains.
+        # A color tint is not a fullscreen solid-color overlay.
+        rgb = [selected.red(), selected.green(), selected.blue()]
+        peak = max(1, *rgb)
+        self.loading = True
+        for channel, intensity in zip(("red", "green", "blue"), rgb):
+            self.sliders[channel].setValue(max(65, round(intensity / peak * 100)))
+        self.loading = False
+        self.save()
+
+    def reset_selected(self):
+        identity = self.monitor_select.currentData()
+        if identity is None:
+            return
+        self.owner.monitor_profiles.pop(identity, None)
+        self.owner.store_monitor_profiles()
+        self.select_monitor()
+        self.owner.update_screen(force=True)
 
 
 class TemperatureGraph(QWidget):
@@ -826,6 +1078,12 @@ class ByteAutoTheme(QMainWindow):
         self.gpu_value = None
         self.gpu_sampled = False
         self.gamma = DisplayGamma()
+        try:
+            loaded_profiles = json.loads(self.data.get("monitor_profiles", "{}"))
+            self.monitor_profiles = loaded_profiles if isinstance(loaded_profiles, dict) else {}
+        except (TypeError, ValueError):
+            self.monitor_profiles = {}
+        self.monitor_dialog = None
         self.last_screen_profile = None
         self.network = QNetworkAccessManager(self)
         self.setWindowTitle(APP)
@@ -1013,8 +1271,22 @@ class ByteAutoTheme(QMainWindow):
             contents.setSpacing(0)
             frame, body = self.panel()
             page_builders[name](body)
-            contents.addWidget(frame, 0)
-            contents.addStretch(1)
+            if name == "screen":
+                # Extra monitor controls remain accessible within the fixed window.
+                scroll = QScrollArea(page)
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QFrame.NoFrame)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                wrapper = QWidget()
+                inner = QVBoxLayout(wrapper)
+                inner.setContentsMargins(0, 0, 3, 0)
+                inner.addWidget(frame)
+                inner.addStretch(1)
+                scroll.setWidget(wrapper)
+                contents.addWidget(scroll, 1)
+            else:
+                contents.addWidget(frame, 0)
+                contents.addStretch(1)
             self.pages.addWidget(page)
         # İlk açılışta Hızlı Ayarlar gösterilir; görünür sekme ile düğme eşleşir.
         self.pages.currentChanged.connect(self.tab_changed)
@@ -1139,6 +1411,10 @@ class ByteAutoTheme(QMainWindow):
     def make_screen(self, body):
         body.addWidget(self.checkbox("screen_enabled"))
         body.addWidget(self.checkbox("screen_auto"))
+        body.addWidget(self.checkbox("screen_follow_theme"))
+        options = self.button("monitor_options")
+        options.clicked.connect(self.open_monitor_settings)
+        body.addWidget(options)
         self.screen_graph = TemperatureGraph(self)
         body.addWidget(self.screen_graph)
         self.screen_day_row = self.screen_slider(body, "screen_day_kelvin", 4500, 7500, 100, " K")
@@ -1163,6 +1439,8 @@ class ByteAutoTheme(QMainWindow):
         for key in ("screen_day_kelvin", "screen_night_kelvin", "screen_manual_kelvin",
                     "screen_night_dim", "screen_transition", "screen_auto"):
             self.controls[key].setEnabled(self.controls["screen_enabled"].isChecked())
+        self.controls["screen_follow_theme"].setEnabled(
+            self.controls["screen_enabled"].isChecked() and automatic)
         self.screen_transition_row[2].setText(
             f"{self.controls['screen_transition'].value()} {'dk' if self.language == 'tr' else 'min'}")
         self.screen_graph.update()
@@ -1318,6 +1596,9 @@ class ByteAutoTheme(QMainWindow):
         registry_set(SETTINGS_KEY, {"language": self.language})
         for widget, setter, key in self.localized:
             getattr(widget, setter)(self.t(key))
+        if self.monitor_dialog is not None:
+            self.monitor_dialog.close()
+            self.monitor_dialog = None  # rebuild localized monitor labels on next opening
         for index in range(self.schedule.count()):
             self.schedule.setItemText(index, self.t(self.schedule.itemData(index)))
         for index in range(self.gpu_interval.count()):
@@ -1463,6 +1744,21 @@ class ByteAutoTheme(QMainWindow):
             return self.t("blocked_idle")
         return ""
 
+    def open_monitor_settings(self):
+        if self.monitor_dialog is None:
+            self.monitor_dialog = MonitorSettingsDialog(self)
+        else:
+            self.monitor_dialog.refresh_monitors()
+        self.monitor_dialog.show()
+        self.monitor_dialog.raise_()
+        self.monitor_dialog.activateWindow()
+
+    def store_monitor_profiles(self):
+        value = json.dumps(self.monitor_profiles, ensure_ascii=False,
+                           separators=(",", ":"))
+        self.data["monitor_profiles"] = value
+        registry_set(SETTINGS_KEY, {"monitor_profiles": value})
+
     def screen_day_bounds(self):
         solar = self.sun_times()
         if solar:
@@ -1483,8 +1779,12 @@ class ByteAutoTheme(QMainWindow):
     def screen_profile(self, hour, bounds=None):
         if not self.data["screen_auto"]:
             return (self.data["screen_manual_kelvin"], self.data["screen_night_dim"])
-        rise, set_ = bounds or self.screen_day_bounds()
-        level = daylight_weight(hour, rise, set_, self.data["screen_transition"])
+        if self.data.get("screen_follow_theme", True):
+            mode = self.last_mode or ("dark" if windows_dark() else "light")
+            level = 0.0 if mode == "dark" else 1.0
+        else:
+            rise, set_ = bounds or self.screen_day_bounds()
+            level = daylight_weight(hour, rise, set_, self.data["screen_transition"])
         temp = round((self.data["screen_night_kelvin"] +
                       (self.data["screen_day_kelvin"] - self.data["screen_night_kelvin"]) * level) / 25) * 25
         dim = round(self.data["screen_night_dim"] * (1 - level))
@@ -1508,7 +1808,8 @@ class ByteAutoTheme(QMainWindow):
         # Always examine EVERY monitor, even when the Kelvin value has not
         # changed. Windows may reset just one display after a theme switch,
         # sleep/resume or a monitor connection change.
-        success = self.gamma.apply(*profile, force=force)
+        success = self.gamma.apply(*profile, force=force,
+                                   profiles=self.monitor_profiles)
         total = len(self.gamma.targets)
         applied = len(self.gamma.applied_names)
         self.last_screen_profile = profile if success else None
@@ -1528,6 +1829,8 @@ class ByteAutoTheme(QMainWindow):
         # Qt screen notifications are emitted for plugged/unplugged displays;
         # the native Windows event also catches resolution/driver changes.
         self.gamma.mark_display_change()
+        if self.monitor_dialog is not None and self.monitor_dialog.isVisible():
+            QTimer.singleShot(800, self.monitor_dialog.refresh_monitors)
         if self.data["screen_enabled"]:
             QTimer.singleShot(500, lambda: self.update_screen(force=True))
             QTimer.singleShot(2300, lambda: self.update_screen(force=True))
@@ -1599,6 +1902,11 @@ class ByteAutoTheme(QMainWindow):
         else:
             self.finish_theme(mode)
 
+    def reapply_wallpaper_if_current(self, wallpaper, mode):
+        if (self.last_mode == mode and self.data["wallpaper_enabled"]
+                and Path(wallpaper).is_file()):
+            set_wallpaper_all_monitors(wallpaper)
+
     def finish_theme(self, mode):
         dark = mode == "dark"
         try:
@@ -1626,6 +1934,14 @@ class ByteAutoTheme(QMainWindow):
             notify_windows()
             # Reconcile color ramps across all monitors after Windows applies
             # a theme; delayed passes handle asynchronous per-display resets.
+            if self.data["wallpaper_enabled"] and not wallpaper_problem:
+                # .theme files and Explorer can asynchronously replace the
+                # wallpaper on secondary screens after our first COM call.
+                wallpaper = self.data["wallpaper_dark" if dark else "wallpaper_light"]
+                if wallpaper and Path(wallpaper).is_file():
+                    for delay in (750, 2500, 5500):
+                        QTimer.singleShot(delay,
+                            lambda p=wallpaper, m=mode: self.reapply_wallpaper_if_current(p, m))
             if self.data["screen_enabled"]:
                 QTimer.singleShot(350, lambda: self.update_screen(force=True))
                 QTimer.singleShot(1800, lambda: self.update_screen(force=True))
@@ -1742,6 +2058,8 @@ class ByteAutoTheme(QMainWindow):
 
     def quit_app(self):
         self.quit_requested = True
+        if self.monitor_dialog is not None:
+            self.monitor_dialog.close()
         self.gamma.restore()
         self.gpu_worker.requestInterruption()
         self.gpu_worker.wait(10000)
