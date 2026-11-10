@@ -26,15 +26,15 @@ You can also change wallpapers, adjust screen colors, and prevent theme changes 
 
 ## 🚀 Getting Started
 
+### Download Windows executable from releases (optional)
+
 ### Run from source
 
 1. Download this repository using **Code → Download ZIP**, then extract it to a folder.
 2. Install [Python](https://www.python.org/downloads/) if you don't already have it.
 3. Open **PowerShell** or **Command Prompt** in the extracted folder.
-4. Install the required packages:\
+4. Install the required packages and then run the py script.
    py -m pip install PySide6 psutil astral tzdata
-5. Start ByteAutoTheme:\
-   py "Byte Auto Theme.py"
 
 The project includes the Python application and its icon. No separate configuration file is needed.
 
