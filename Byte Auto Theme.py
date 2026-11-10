@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -142,7 +143,10 @@ TEXT = {
     "screen_transition": ("Yumuşak geçiş", "Smooth transition"),
     "screen_now": ("Şimdi: {temp} K · %{dim} karartma", "Now: {temp} K · {dim}% dimming"),
     "screen_off": ("Ekran ayarı kapalı", "Screen adjustment off"),
-    "screen_unavailable": ("Ekran sürücüsü renk ayarını desteklemiyor", "Display driver does not support color adjustment"),
+    "screen_unavailable": ("Ekranların renk ayarı uygulanamadı (HDR veya sürücü kısıtı olabilir)",
+                           "Could not adjust displays (HDR or driver restriction may apply)"),
+    "screen_monitors": ("Monitörler: {ok}/{total}", "Monitors: {ok}/{total}"),
+    "screen_partial": ("Uygulanamayan: {names}", "Not applied: {names}"),
     "screen_note": ("Şehir seçiliyse güneş saatleri, değilse gündüz/gece saatleri kullanılır. HDR veya Gece Işığı etkileyebilir.",
                     "Uses sunrise/sunset when a city is set; otherwise day/night times. HDR or Night light may interfere."),
     "system_ui": ("Sistem temasını izle", "Follow system theme"),
@@ -295,6 +299,61 @@ def notify_windows():
         ctypes.windll.user32.SendMessageTimeoutW(
             0xFFFF, 0x001A, 0, ctypes.c_wchar_p(setting), 0x0002, 350,
             ctypes.byref(result))
+
+
+def set_wallpaper_all_monitors(path):
+    """Windows 10/11: assign one wallpaper to *every* connected monitor.
+
+    SPI_SETDESKWALLPAPER is legacy and can leave secondary wallpapers unchanged
+    if Windows is using per-monitor wallpapers. IDesktopWallpaper explicitly
+    targets every monitor when its monitorID parameter is NULL.
+    """
+    if not WINDOWS:
+        return False
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    def make_guid(value):
+        return GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [ctypes.POINTER(GUID), ctypes.c_void_p,
+                                      ctypes.c_uint, ctypes.POINTER(GUID),
+                                      ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+
+    initialized = ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+    # RPC_E_CHANGED_MODE means another library already initialized COM as MTA.
+    if initialized not in (0, 1, -2147417850):
+        return False
+    instance = ctypes.c_void_p()
+    try:
+        clsid = make_guid("C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD")
+        iid = make_guid("B92B56A9-8B55-4E14-9A89-0199BBB6F93B")
+        hr = ole32.CoCreateInstance(ctypes.byref(clsid), None,
+                                    4,  # CLSCTX_LOCAL_SERVER
+                                    ctypes.byref(iid), ctypes.byref(instance))
+        if hr != 0 or not instance.value:
+            return False
+        vtable = ctypes.cast(instance, ctypes.POINTER(
+            ctypes.POINTER(ctypes.c_void_p))).contents
+        set_wallpaper = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p)(vtable[3])
+        return set_wallpaper(instance, None, str(Path(path).resolve())) == 0
+    finally:
+        if instance.value:
+            vtable = ctypes.cast(instance, ctypes.POINTER(
+                ctypes.POINTER(ctypes.c_void_p))).contents
+            release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+            release(instance)
+        if initialized in (0, 1):
+            ole32.CoUninitialize()
 
 
 def set_color_filter(enabled):
@@ -500,33 +559,55 @@ def daylight_weight(hour, sunrise, sunset, transition_minutes):
 
 
 class DisplayGamma:
-    """Temporary per-display LUT: saves original in RAM, restores on disable/exit.
+    """Apply/restore a gamma LUT independently for every active Windows display.
 
-    Only available on Windows GDI drivers with gamma ramp support. These APIs
-    are not guaranteed to work with HDR or other active color-management apps.
+    Windows can reset gamma ramps when a theme, driver, HDR mode or monitor
+    topology changes. The active display list and current ramps are checked on
+    each update instead of relying on one cached, potentially stale DC.
+
+    Windows/GDI drivers can refuse or silently ignore gamma changes, notably
+    with HDR. Read-back is best-effort verification, not a hardware guarantee.
     """
 
+    # Tolerance for display-driver quantization of 16-bit LUT entries.
+    READBACK_TOLERANCE = 1024
+
     def __init__(self):
-        self.displays = []
+        self.displays = {}       # device name -> {dc, original}
+        self.targets = {}        # active logical display name -> monitor rectangle
+        self.applied_names = []
+        self.failed_names = []
+        self._topology = None
+        self._reopen = False
         if not WINDOWS:
             return
+
         from ctypes import wintypes
 
-        class DisplayDevice(ctypes.Structure):
+        class MonitorInfoEx(ctypes.Structure):
             _fields_ = [
-                ("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32),
-                ("DeviceString", wintypes.WCHAR * 128), ("StateFlags", wintypes.DWORD),
-                ("DeviceID", wintypes.WCHAR * 128), ("DeviceKey", wintypes.WCHAR * 128),
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+                ("szDevice", wintypes.WCHAR * 32),
             ]
 
-        self.device_type = DisplayDevice
-        self.gdi = ctypes.WinDLL("gdi32")
-        self.user32 = ctypes.WinDLL("user32")
-        self.user32.EnumDisplayDevicesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint,
-                                                    ctypes.POINTER(DisplayDevice), ctypes.c_uint]
-        self.user32.EnumDisplayDevicesW.restype = ctypes.c_int
+        self.monitor_info_type = MonitorInfoEx
+        self.monitor_callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(wintypes.RECT), ctypes.c_ssize_t)
+        self.gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.user32.EnumDisplayMonitors.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, self.monitor_callback_type,
+            ctypes.c_ssize_t,
+        ]
+        self.user32.EnumDisplayMonitors.restype = ctypes.c_int
+        self.user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.user32.GetMonitorInfoW.restype = ctypes.c_int
         self.gdi.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
-                                       ctypes.c_wchar_p, ctypes.c_void_p]
+                                        ctypes.c_wchar_p, ctypes.c_void_p]
         self.gdi.CreateDCW.restype = ctypes.c_void_p
         self.gdi.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.gdi.GetDeviceGammaRamp.restype = ctypes.c_int
@@ -535,54 +616,148 @@ class DisplayGamma:
         self.gdi.DeleteDC.argtypes = [ctypes.c_void_p]
         self.gdi.DeleteDC.restype = ctypes.c_int
 
-    def open(self):
-        if self.displays or not WINDOWS:
-            return bool(self.displays)
-        for index in range(24):
-            device = self.device_type()
-            device.cb = ctypes.sizeof(device)
-            if not self.user32.EnumDisplayDevicesW(None, index, ctypes.byref(device), 0):
-                break
-            if not (device.StateFlags & 1) or device.StateFlags & 8:
-                continue
-            dc = self.gdi.CreateDCW("DISPLAY", device.DeviceName, None, None)
-            if not dc:
-                continue
-            original = (ctypes.c_ushort * 768)()
-            if self.gdi.GetDeviceGammaRamp(dc, ctypes.byref(original)):
-                self.displays.append((dc, original))
-            else:
-                self.gdi.DeleteDC(dc)
-        return bool(self.displays)
+    def mark_display_change(self):
+        """Invalidate monitor DCs after Windows has changed the display layout."""
+        self._reopen = True
 
-    def apply(self, kelvin, dim_percent):
-        if not self.open():
+    def _enumerate_monitors(self):
+        """List active desktop displays, including external and USB monitors."""
+        monitors = {}
+
+        def receive(monitor, _hdc, _rect, _context):
+            info = self.monitor_info_type()
+            info.cbSize = ctypes.sizeof(info)
+            if self.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                rect = info.rcMonitor
+                monitors[info.szDevice] = (
+                    rect.left, rect.top, rect.right, rect.bottom)
+            return 1
+
+        callback = self.monitor_callback_type(receive)
+        self.user32.EnumDisplayMonitors(None, None, callback, 0)
+        return monitors
+
+    def _read_ramp(self, dc):
+        ramp = (ctypes.c_ushort * 768)()
+        if self.gdi.GetDeviceGammaRamp(dc, ctypes.byref(ramp)):
+            return ramp
+        return None
+
+    def _open_display(self, name, old_state=None):
+        # The GDI device name (e.g. r"\.\DISPLAY2") targets a particular
+        # monitor; a plain desktop DC would usually target the primary screen.
+        dc = self.gdi.CreateDCW(name, None, None, None)
+        if not dc:
+            return None
+        original = self._read_ramp(dc)
+        if original is None:
+            self.gdi.DeleteDC(dc)
+            return None
+        # Preserve the pre-adjustment calibration across mode/layout changes.
+        # Never use an already color-adjusted ramp as a new baseline.
+        if old_state is not None:
+            original = old_state["original"]
+        return {"dc": dc, "original": original}
+
+    def _refresh_displays(self):
+        if not WINDOWS:
+            self.targets = {}
+            return
+        targets = self._enumerate_monitors()
+        topology = tuple(sorted(targets.items()))
+        if topology == self._topology and not self._reopen and len(self.displays) == len(targets):
+            self.targets = targets
+            return
+
+        previous = self.displays
+        current = {}
+        for name in targets:
+            old = previous.get(name)
+            if old and topology == self._topology and not self._reopen:
+                current[name] = old
+                continue
+            replacement = self._open_display(name, old)
+            if replacement is not None:
+                current[name] = replacement
+
+        # When the monitor configuration changes, the old contexts can be
+        # invalid; don't attempt restoration through those stale handles.
+        for state in previous.values():
+            if state not in current.values():
+                self.gdi.DeleteDC(state["dc"])
+
+        self.displays = current
+        self.targets = targets
+        self._topology = topology
+        self._reopen = False
+
+    @staticmethod
+    def _ramp_for(original, scales):
+        ramp = (ctypes.c_ushort * 768)()
+        for channel in range(3):
+            offset = 256 * channel
+            scale = scales[channel]
+            for i in range(256):
+                ramp[offset + i] = min(65535, round(original[offset + i] * scale))
+        return ramp
+
+    @classmethod
+    def _approximately_equal(cls, current, wanted):
+        if current is None:
             return False
+        # Sampling is sufficient to detect the usual Windows gamma resets.
+        return all(abs(int(current[channel * 256 + index]) -
+                       int(wanted[channel * 256 + index])) <= cls.READBACK_TOLERANCE
+                   for channel in range(3)
+                   for index in (0, 32, 64, 128, 192, 255))
+
+    def apply(self, kelvin, dim_percent, force=False):
+        self.applied_names = []
+        self.failed_names = []
+        self._refresh_displays()
+        if not self.targets:
+            return False
+
         reference = kelvin_rgb(6500)
         requested = kelvin_rgb(kelvin)
         brightness = 1.0 - min(30.0, max(0.0, float(dim_percent))) / 100.0
-        # GDI deliberately rejects extreme ramps; constrain the effect so the
-        # desktop stays legible even at the warmest/dimmest setting.
-        scales = [max(0.54, min(1.0, requested[i] / max(.001, reference[i]) * brightness))
-                  for i in range(3)]
-        success = False
-        for dc, original in self.displays:
-            ramp = (ctypes.c_ushort * 768)()
-            for channel in range(3):
-                scale = scales[channel]
-                offset = 256 * channel
-                for i in range(256):
-                    ramp[offset + i] = min(65535, round(original[offset + i] * scale))
-            success = bool(self.gdi.SetDeviceGammaRamp(dc, ctypes.byref(ramp))) or success
-        return success
+        scales = [max(0.54, min(1.0, requested[i] /
+                   max(.001, reference[i]) * brightness)) for i in range(3)]
+
+        for name in self.targets:
+            state = self.displays.get(name)
+            if state is None:
+                self.failed_names.append(name)
+                continue
+            dc = state["dc"]
+            wanted = self._ramp_for(state["original"], scales)
+            present = self._read_ramp(dc)
+            if force or not self._approximately_equal(present, wanted):
+                # Windows can return TRUE but still reject an extreme LUT, so
+                # verify the read-back (to the extent the driver permits).
+                applied = bool(self.gdi.SetDeviceGammaRamp(dc, ctypes.byref(wanted)))
+                present = self._read_ramp(dc) if applied else None
+            if self._approximately_equal(present, wanted):
+                self.applied_names.append(name)
+            else:
+                self.failed_names.append(name)
+
+        return bool(self.applied_names)
 
     def restore(self):
         if not WINDOWS:
             return
-        for dc, original in self.displays:
-            self.gdi.SetDeviceGammaRamp(dc, ctypes.byref(original))
-            self.gdi.DeleteDC(dc)
+        self._refresh_displays()
+        for state in self.displays.values():
+            self.gdi.SetDeviceGammaRamp(state["dc"],
+                                         ctypes.byref(state["original"]))
+            self.gdi.DeleteDC(state["dc"])
         self.displays.clear()
+        self.targets.clear()
+        self.applied_names.clear()
+        self.failed_names.clear()
+        self._topology = None
+        self._reopen = False
 
 
 class TemperatureGraph(QWidget):
@@ -661,6 +836,12 @@ class ByteAutoTheme(QMainWindow):
         self.set_ui_theme(force=True)
         self.build_tray()
         self.connect_controls()
+        # Qt notifies us immediately when an external monitor is attached,
+        # unplugged or becomes the primary display.
+        app = QApplication.instance()
+        app.screenAdded.connect(self.display_configuration_changed)
+        app.screenRemoved.connect(self.display_configuration_changed)
+        app.primaryScreenChanged.connect(self.display_configuration_changed)
 
         # Persist all defaults once, then only write modified preferences.
         registry_set(SETTINGS_KEY, self.data)
@@ -967,6 +1148,7 @@ class ByteAutoTheme(QMainWindow):
         self.screen_transition_row = self.screen_slider(body, "screen_transition", 15, 180, 15, " dk")
         self.screen_status = QLabel()
         self.screen_status.setObjectName("hint")
+        self.screen_status.setWordWrap(True)
         body.addWidget(self.screen_status)
         body.addWidget(self.label("screen_note", True))
         self.update_screen_panels()
@@ -1312,23 +1494,60 @@ class ByteAutoTheme(QMainWindow):
         if not hasattr(self, "screen_status"):
             return
         if not self.data["screen_enabled"]:
-            self.gamma.restore()
+            # Restore the saved original LUT on every connected display.
+            if self.gamma.displays:
+                self.gamma.restore()
             self.last_screen_profile = None
             self.screen_status.setText(self.t("screen_off"))
             self.screen_graph.update()
             return
+
         now = datetime.datetime.now()
         current = now.hour + now.minute / 60 + now.second / 3600
         profile = self.screen_profile(current)
-        if force or profile != self.last_screen_profile:
-            if not self.gamma.apply(*profile):
-                self.last_screen_profile = None
-                self.screen_status.setText(self.t("screen_unavailable"))
-                self.screen_graph.update()
-                return
-            self.last_screen_profile = profile
-        self.screen_status.setText(self.t("screen_now", temp=profile[0], dim=profile[1]))
+        # Always examine EVERY monitor, even when the Kelvin value has not
+        # changed. Windows may reset just one display after a theme switch,
+        # sleep/resume or a monitor connection change.
+        success = self.gamma.apply(*profile, force=force)
+        total = len(self.gamma.targets)
+        applied = len(self.gamma.applied_names)
+        self.last_screen_profile = profile if success else None
+        if not success:
+            self.screen_status.setText(self.t("screen_unavailable") + " · " +
+                                       self.t("screen_monitors", ok=applied, total=total))
+        else:
+            caption = (self.t("screen_now", temp=profile[0], dim=profile[1]) + " · " +
+                       self.t("screen_monitors", ok=applied, total=total))
+            if self.gamma.failed_names:
+                caption += "\n" + self.t("screen_partial",
+                                         names=", ".join(self.gamma.failed_names))
+            self.screen_status.setText(caption)
         self.screen_graph.update()
+
+    def display_configuration_changed(self, *_args):
+        # Qt screen notifications are emitted for plugged/unplugged displays;
+        # the native Windows event also catches resolution/driver changes.
+        self.gamma.mark_display_change()
+        if self.data["screen_enabled"]:
+            QTimer.singleShot(500, lambda: self.update_screen(force=True))
+            QTimer.singleShot(2300, lambda: self.update_screen(force=True))
+        if self.data["wallpaper_enabled"] and self.last_mode in ("light", "dark"):
+            wallpaper = self.data["wallpaper_" + self.last_mode]
+            if wallpaper and Path(wallpaper).is_file():
+                QTimer.singleShot(1200,
+                    lambda p=wallpaper: set_wallpaper_all_monitors(p))
+
+    def nativeEvent(self, event_type, message):
+        if WINDOWS:
+            try:
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                # WM_DISPLAYCHANGE, WM_DEVICECHANGE, WM_POWERBROADCAST
+                if msg.message in (0x007E, 0x0219, 0x0218):
+                    self.display_configuration_changed()
+            except (ValueError, TypeError, OSError):
+                pass
+        return super().nativeEvent(event_type, message)
 
     def tick(self):
         self.set_ui_theme()
@@ -1403,9 +1622,14 @@ class ByteAutoTheme(QMainWindow):
                 wallpaper = self.data["wallpaper_dark" if dark else "wallpaper_light"]
                 if wallpaper:
                     wallpaper_problem = (not Path(wallpaper).is_file() or
-                        not ctypes.windll.user32.SystemParametersInfoW(
-                            20, 0, ctypes.c_wchar_p(wallpaper), 3))
+                                         not set_wallpaper_all_monitors(wallpaper))
             notify_windows()
+            # Reconcile color ramps across all monitors after Windows applies
+            # a theme; delayed passes handle asynchronous per-display resets.
+            if self.data["screen_enabled"]:
+                QTimer.singleShot(350, lambda: self.update_screen(force=True))
+                QTimer.singleShot(1800, lambda: self.update_screen(force=True))
+                QTimer.singleShot(4200, lambda: self.update_screen(force=True))
             self.last_mode = mode
             self.set_ui_theme()
             self.update_appearance_label()
