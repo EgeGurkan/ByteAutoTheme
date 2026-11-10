@@ -26,7 +26,7 @@ You can also change wallpapers, adjust screen colors, and prevent theme changes 
 
 ## 🚀 Getting Started
 
-### Download Windows executable from releases (optional)
+### Download Windows executable from releases
 
 ### Run from source
 
@@ -38,7 +38,7 @@ You can also change wallpapers, adjust screen colors, and prevent theme changes 
 
 The project includes the Python application and its icon. No separate configuration file is needed.
 
-### Build a Windows executable (optional)
+### Build a Windows executable
 
 If you prefer a standalone `.exe`, you can build one from the source:
 
