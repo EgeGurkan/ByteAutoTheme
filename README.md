@@ -1,161 +1,78 @@
-# ByteAutoTheme
+# 🌗 ByteAutoTheme
 
 **Automatic light and dark mode switching for Windows 10 and Windows 11.**
 
-ByteAutoTheme is a lightweight desktop utility built with Python and PySide6. It lets you switch Windows themes manually, at specific times, or according to local sunrise and sunset. It can also change wallpapers, apply `.theme` files, adjust display color temperature, and postpone automatic switches while you're busy.
+ByteAutoTheme makes it easy to keep your Windows desktop comfortable throughout the day. Switch between light and dark mode whenever you want, set your own schedule, or let the app follow sunrise and sunset in your city.
 
-> **Platform:** Windows 10 / Windows 11  
-> **Interface languages:** English and Turkish  
-> **Default behavior:** Manual switching; automation is optional.
+You can also change wallpapers, adjust screen colors, and prevent theme changes from interrupting games or other activities — all from a simple desktop app.
 
-## Features
+## ✨ Features
 
-### 🌗 Theme automation
+- **Automatic theme switching** — Choose specific times or use local sunrise and sunset. Manual switching is always available.
+- **Customize what changes** — Control Windows and app themes separately, with optional accent colors, touch keyboard settings, and color filters.
+- **Light and dark wallpapers** — Pick a different wallpaper for each mode and apply it across connected monitors.
+- **Windows theme files** — Use your own `.theme` files for a more personalized setup.
+- **Comfortable screen colors** — Adjust color temperature and dimming for daytime or nighttime, with smooth transitions and a daily preview graph.
+- **Per-monitor adjustments** — Detect connected displays and set individual color temperature adjustments, dimming, and RGB tint levels for each supported monitor.
+- **Smart pause options** — Delay automatic switches while certain apps are running, GPU usage is high, or you're actively using your PC.
+- **Runs in the background** — Access quick actions from the system tray, launch with Windows, and enable optional notifications.
+- **English and Turkish interface** — Choose your preferred language and app appearance.
 
-- **Manual switching:** Change between light and dark mode instantly.
-- **Time-based scheduling:** Set separate times for daytime and nighttime modes.
-- **Sunrise/sunset scheduling:** Calculate local transition times for a selected city.
-- **City lookup:** Common Turkish cities are available offline; other locations can be searched using the Open-Meteo geocoding API.
-- **Independent targets:** Choose whether to switch the Windows interface, application theme, or both.
+## 💻 Requirements
 
-### 🎨 Personalization
+- **Windows 10 or Windows 11**
+- **Python 3.10 or newer** if running the source code
+- An internet connection is only needed when searching for cities not included in the app's built-in list.
 
-- Assign different **wallpapers** for light and dark mode.
-- Apply separate Windows **`.theme` files** when switching.
-- Configure accent colors for **title bars/window borders** and the **taskbar**.
-- Optionally adjust the **touch keyboard theme** and toggle Windows' selected **color filter** in dark mode.
+## 🚀 Getting Started
 
-### 🌡️ Display adjustments
+### Run from source
 
-- Set a fixed display color temperature or vary it automatically during the day.
-- Configure day/night color temperatures, nighttime dimming, and smooth transition duration.
-- Preview the 24-hour temperature profile in a built-in graph.
-- Apply adjustments through Windows display gamma ramps, with restoration when the feature is disabled or the app exits normally.
-
-> Display adjustments require a compatible graphics driver. HDR, Windows Night Light, and third-party color-management software may affect the result.
-
-### 🎮 Intelligent switch protection
-
-Automatic switching can be postponed when:
-
-- **GPU usage** exceeds your configured threshold.
-- **Selected applications** are running (for example, a game or recording software).
-- **You are actively using the PC**, until the configured idle period has passed.
-
-GPU monitoring uses Windows performance counters through PowerShell and may not be available on every system.
-
-### ⚙️ Everyday convenience
-
-- Runs in the background with an optional **system tray icon** and quick theme actions.
-- Optional **start with Windows** and theme-switch notifications.
-- **Single-instance behavior:** Running the app again brings its existing window forward.
-- Compact six-tab interface with **English/Turkish language switching** and independent light/dark UI styling.
-- Saves preferences in the Windows Registry; **no separate settings JSON file** is required.
-
-## Requirements
-
-- Windows 10 or Windows 11
-- Python **3.10+ recommended** for running from source
-- Python packages: `PySide6`, `psutil`, `astral`, `tzdata`
-- `PyInstaller` (only if building the executable)
-
-## Run from source
-
-1. Download the source file and icon into the same folder.
-2. Rename the Python file to **`Byte Auto Theme.py`** if it has a download suffix such as `(2)`.
-3. Open PowerShell or Command Prompt in that folder and install the dependencies:
-
-   ```powershell
-   py -m pip install --upgrade PySide6 psutil astral tzdata
-   ```
-
-4. Launch the application:
-
-   ```powershell
+1. Download this repository using **Code → Download ZIP**, then extract it to a folder.
+2. Install [Python](https://www.python.org/downloads/) if you don't already have it.
+3. Open **PowerShell** or **Command Prompt** in the extracted folder.
+4. Install the required packages:\
+   py -m pip install PySide6 psutil astral tzdata
+5. Start ByteAutoTheme:\
    py "Byte Auto Theme.py"
-   ```
 
-On Windows, the script attempts to relaunch itself through `pythonw.exe` so that a console window does not remain open.
+The project includes the Python application and its icon. No separate configuration file is needed.
 
-## Build a standalone `.exe`
+### Build a Windows executable (optional)
 
-Install PyInstaller:
+If you prefer a standalone `.exe`, you can build one from the source:
 
-```powershell
-py -m pip install --upgrade pyinstaller
 ```
-
-From the project folder, run:
-
-```powershell
+py -m pip install pyinstaller
 py -m PyInstaller --noconfirm --clean --onefile --windowed --name "ByteAutoTheme" --icon "ByteAutoTheme.ico" --collect-all tzdata --collect-all astral "Byte Auto Theme.py"
 ```
 
-The generated executable will be located at:
+Your executable will be created at **`dist\ByteAutoTheme.exe`**.
 
-```text
-dist\ByteAutoTheme.exe
-```
+## 🛠️ How to Use
 
-The `--windowed` option hides the console window. The `--onefile` option packages the application into a single executable. To use a different source filename, update the last argument of the build command accordingly.
+Once ByteAutoTheme is open, you'll find six main sections:
 
-## Getting started
-
-1. Open **Quick Settings** to apply light or dark mode immediately.
-2. Open **Automation** and choose **Manual**, **Time Range**, or **Sunrise / Sunset**.
-3. For sunrise/sunset mode, search for and select your city.
-4. Use **Personalization** to choose which Windows components to change and optionally assign wallpapers or `.theme` files.
-5. Use **Screen** to enable display color temperature and dimming adjustments.
-6. Use **Conditions** to avoid interruptions during gaming, selected apps, or active use.
-7. In **General**, configure startup, notifications, and tray visibility.
-
-Changes are saved automatically.
-
-## Settings and behavior
-
-Application preferences are stored at:
-
-```text
-HKEY_CURRENT_USER\Software\ByteAutoTheme
-```
-
-Windows-specific changes are applied through the current user's theme/personalization settings and the relevant Windows APIs. Enabling **Start with Windows** adds an entry under:
-
-```text
-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
-```
-
-Closing the window normally keeps ByteAutoTheme running in the background. Use **Exit Completely** in the application or tray menu to quit.
-
-## Notes and limitations
-
-- **Windows only:** Windows theme switching and display gamma controls use Windows APIs.
-- **Optional internet access:** City lookup outside the bundled Turkish city list contacts the Open-Meteo geocoding service. Sunrise/sunset calculations themselves run locally using `astral` once location information is available.
-- **GPU monitoring:** The GPU-usage condition depends on Windows GPU performance counters; if they are unavailable, that protection can prevent automatic switching until disabled.
-- **Display compatibility:** Gamma-ramp adjustments may be unsupported or overridden by HDR, Night Light, or graphics utilities.
-- **Theme file behavior:** Applying a `.theme` file delegates to Windows and may alter other personalization settings.
-- **System tray:** If the tray icon is hidden, launch the application again to reopen the existing window.
-
-## Technology stack
-
-| Component | Purpose |
+| Section | What it does |
 | --- | --- |
-| Python | Application logic and Windows integration |
-| PySide6 (Qt) | Desktop interface, tray, threading, and networking |
-| psutil | Running-process detection |
-| astral + tzdata | Sunrise/sunset calculations and time zones |
-| Windows Registry / Win32 APIs | Theme, startup, and display integration |
-| PyInstaller | Optional Windows executable packaging |
+| **Quick Settings** | Switch between light and dark mode instantly. |
+| **Automation** | Choose manual, scheduled, or sunrise/sunset switching. |
+| **Conditions** | Pause automatic changes while gaming, using selected apps, or actively working. |
+| **Personalization** | Choose wallpapers, Windows themes, and system appearance options. |
+| **Screen** | Set screen warmth, dimming, and individual monitor color adjustments. |
+| **General** | Manage startup, notifications, language, and system tray behavior. |
 
-## Project files
+**A simple setup:** Open **Automation**, choose **Sunrise / Sunset**, and select your city. Then visit **Personalization** to choose what should change when the mode switches. You can enable screen adjustments separately in **Screen**.
 
-```text
-ByteAutoTheme/
-├── Byte Auto Theme.py
-├── ByteAutoTheme.ico
-└── README.md
-```
+Your preferences are saved automatically.
 
----
+## 📌 Good to Know
 
-**ByteAutoTheme** — a customizable way to keep your Windows desktop in sync with your day.
+- **Closing the window doesn't exit the app.** ByteAutoTheme continues running in the background. Use **Exit Completely** from the app or system tray when you want to stop it.
+- **Multi-monitor color controls depend on your hardware.** HDR, mirrored displays, some graphics drivers, or Windows Night Light may limit independent color adjustments.
+- **Sunrise and sunset times** are calculated for your selected city. Common Turkish cities are available offline; searching for other cities may require internet access.
+- **Settings are stored locally** in your Windows user settings. No account or cloud service is required for normal use.
+
+## 🤝 Feedback and Contributions
+
+Found a bug or have an idea for an improvement? Feel free to [open an issue](https://github.com/EgeGurkan/ByteAutoTheme/issues). Suggestions and contributions are welcome.
