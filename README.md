@@ -1,6 +1,6 @@
 # 🌗 ByteAutoTheme
 
-**Automatic light and dark mode switching for Windows 10 and Windows 11.**
+**Automatic light and dark mode switching**
 
 ByteAutoTheme makes it easy to keep your Windows desktop comfortable throughout the day. Switch between light and dark mode whenever you want, set your own schedule, or let the app follow sunrise and sunset in your city.
 
